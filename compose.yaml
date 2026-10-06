@@ -2,6 +2,9 @@ services:
   mealie-skylight-sync:
     build: .
     image: mealie-skylight-sync:local
+    # Built from source, never pulled - stops `compose pull` from trying
+    # Docker Hub (and lets orchestrators like Komodo keep pre-pull on).
+    pull_policy: build
     restart: unless-stopped
     environment:
       - MEALIE_URL=${MEALIE_URL}

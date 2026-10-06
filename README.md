@@ -93,7 +93,8 @@ cycle (or a restart with `DRY_RUN=never`) goes live.
 ### Komodo deployment
 
 1. **Stacks → New Stack**, point it at this repo (it builds the
-   Dockerfile on your host — arm64 works natively).
+   Dockerfile on your host — arm64 works natively; `pull_policy: build`
+   keeps Komodo's image pre-pull from looking for it on Docker Hub).
 2. Add the environment variables above in the stack's Environment
    (put `MEALIE_TOKEN` and the Skylight credentials in Komodo
    secrets/variables). Set `DRY_RUN=once` for the first deploy.
