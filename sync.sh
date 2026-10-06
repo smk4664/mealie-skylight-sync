@@ -215,16 +215,18 @@ run_sync() {
             --date "$date" --meal-category-id "$cat" >/dev/null \
             || { log "ERROR: create sitting failed ($date '$title')"; return 1; }
         else
+          # CLI marks --recipe-id required, but the API accepts text-only
+          # sittings; an empty value satisfies the flag check (v0.2.6).
           summary="$(jq -r '.summary' <<<"$act")"
-          sky meal create-sitting --date "$date" --meal-category-id "$cat" \
-            --summary "$summary" >/dev/null \
+          sky meal create-sitting --recipe-id "" --date "$date" \
+            --meal-category-id "$cat" --summary "$summary" >/dev/null \
             || { log "ERROR: create sitting failed ($date '$title')"; return 1; }
         fi
         ;;
       delete)
         id="$(jq -r '.id' <<<"$act")"
         log "Delete sitting: $date '$title'"
-        sky meal delete-sitting --sitting-id "$id" --yes >/dev/null \
+        sky meal delete-sitting --sitting-id "$id" --date "$date" --yes >/dev/null \
           || { log "ERROR: delete sitting failed ($date '$title')"; return 1; }
         ;;
     esac
