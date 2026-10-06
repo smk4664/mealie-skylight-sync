@@ -3,11 +3,18 @@
 # Stateless: each cycle fetches both sides, diffs, applies.
 # Spec: .superpowers/docs/specs/2026-10-06-mealie-skylight-sync-design.md
 #
-# API findings (discovered 2026-10-06 against go-skylight v0.2.6):
+# API findings (discovered 2026-10-06 against go-skylight v0.2.6 / live API):
 # - SKYLIGHT_FRAME_ID env var is BROKEN in v0.2.6; --frame-id flag works.
-# - meal categories/recipes/sittings return FLAT JSON arrays (no envelope).
+# - meal categories/recipes/sittings list as FLAT JSON arrays (no envelope);
+#   create responses come back ARRAY-WRAPPED.
 # - Recipe title lives in "summary"; category name in "label".
-# - Sittings: date (YYYY-MM-DD), recipe_id, meal_category_id, summary, id.
+# - Recipes REQUIRE meal_category (422 otherwise).
+# - Sittings are EITHER recipe sittings (recipe_id, summary must be blank)
+#   OR text sittings (summary, no recipe). Hence: Mealie recipe entries ->
+#   recipe sittings; Mealie note entries -> text sittings; Mealie "side"
+#   entries -> text sittings ("Side: ...") in the Dinner category.
+# - Sync identity = date|category|(R:recipe_id or N:summary). Any change is
+#   delete+create; there is no update operation.
 set -euo pipefail
 
 : "${MEALIE_URL:?MEALIE_URL required}"
@@ -33,7 +40,7 @@ if date -d tomorrow >/dev/null 2>&1; then GNU_DATE=1; else GNU_DATE=; fi
 date_plus_days() {  # N -> YYYY-MM-DD
   if [[ -n "$GNU_DATE" ]]; then date -d "+$1 days" +%F; else date -v"+$1d" +%F; fi
 }
-epoch_at() {  # HH:MM on today|tomorrow -> epoch seconds
+epoch_at() {  # today|tomorrow HH:MM -> epoch seconds
   local day="$1" hm="$2"
   if [[ -n "$GNU_DATE" ]]; then
     date -d "$day $hm" +%s
@@ -72,25 +79,30 @@ ensure_category() {
       log "DRY: would create meal category '$name'"; echo "DRY-CAT"; return
     fi
     log "Creating meal category: $name"
-    id="$(sky meal create-category --name "$name" | jq -r '.id')"
+    id="$(sky meal create-category --name "$name" \
+      | jq -r 'if type=="array" then .[0] else . end | .id // empty')" || id=""
+    [[ -n "$id" && "$id" != "null" ]] || { log "ERROR: category create failed for '$name'"; return 1; }
     CATEGORIES="$(sky meal categories)"
   fi
   echo "$id"
 }
 
-# ensure_recipe TITLE DESC URL -> id (creates if missing; matches by title)
+# ensure_recipe TITLE DESC URL CAT_ID -> id (creates if missing; matches
+# by title). Skylight REQUIRES meal_category on recipes (422 otherwise).
 ensure_recipe() {
-  local title="$1" desc="$2" url="$3" id
+  local title="$1" desc="$2" url="$3" cat_id="$4" id
   id="$(jq -r --arg t "$title" 'map(select(.summary==$t))|.[0].id // empty' <<<"$RECIPES")"
   if [[ -z "$id" ]]; then
     if [[ -n "$EFFECTIVE_DRY" ]]; then
       log "DRY: would create recipe '$title'"; echo "DRY-RID"; return
     fi
     log "Creating Skylight recipe: $title"
-    local args=(meal create-recipe --title "$title")
+    local args=(meal create-recipe --title "$title" --meal-category-id "$cat_id")
     [[ -n "$desc" ]] && args+=(--description "$desc")
     [[ -n "$url" ]] && args+=(--url "$url")
-    id="$(sky "${args[@]}" | jq -r '.id')"
+    id="$(sky "${args[@]}" \
+      | jq -r 'if type=="array" then .[0] else . end | .id // empty')" || id=""
+    [[ -n "$id" && "$id" != "null" ]] || { log "ERROR: recipe create failed for '$title'"; return 1; }
     RECIPES="$(sky meal recipes)"
   fi
   echo "$id"
@@ -116,63 +128,67 @@ run_sync() {
   sittings="$(sky meal sittings --date-min "$start" --date-max "$end")" \
     || { log "ERROR: sittings fetch failed"; return 1; }
 
-  # Desired state: breakfast/lunch/dinner entries become sittings; "side"
-  # entries fold into that date's dinner summary; snack/drink/dessert skip.
+  # Desired rows. kind=recipe -> recipe sitting; kind=note -> text sitting.
+  # Mealie "side" entries become "Side: ..." text sittings under Dinner.
   local desired
-  desired="$(jq -c --arg mealie_url "$MEALIE_URL" '
-    ([.items[] | select(.entryType=="side")
-      | {date, note: (.recipe.name // .title // "side")}]
-     | group_by(.date)
-     | map({key: .[0].date, value: (map(.note) | join("; "))})
-     | from_entries) as $sides
-    | [.items[]
-       | select(.entryType=="breakfast" or .entryType=="lunch" or .entryType=="dinner")
-       | {date,
-          entryType,
-          title: (if .recipe then .recipe.name else (.title // "Untitled") end),
-          url:   (if .recipe then ($mealie_url + "/g/home/r/" + .recipe.slug) else "" end),
-          desc:  (if .recipe then ((.recipe.description // "")[0:180]) else (.text // "") end)}
-       | . + {summary:
-           (if .entryType=="dinner" and $sides[.date] then ("side: " + $sides[.date]) else "" end)}]
+  desired="$(jq -c '
+    [.items[]
+     | if .entryType=="breakfast" or .entryType=="lunch" or .entryType=="dinner" then
+         (if .recipe
+          then {date, cat_name: .entryType, kind: "recipe",
+                title: .recipe.name, slug: .recipe.slug,
+                desc: ((.recipe.description // "")[0:180])}
+          else {date, cat_name: .entryType, kind: "note",
+                title: (.title // "Untitled"),
+                summary: (.title // "Untitled")}
+          end)
+       elif .entryType=="side" then
+         {date, cat_name: "dinner", kind: "note",
+          title: ("Side: " + (.recipe.name // .title // "side")),
+          summary: ("Side: " + (.recipe.name // .title // "side"))}
+       else empty end]
   ' <<<"$mealie")"
 
   local skipped
   skipped="$(jq -r '[.items[] | select(.entryType=="snack" or .entryType=="drink" or .entryType=="dessert")] | length' <<<"$mealie")"
   [[ "$skipped" != "0" ]] && log "Skipping $skipped snack/drink/dessert entries (no Skylight equivalent)"
 
-  # Ensure categories + recipes exist; annotate desired rows with ids.
-  local annotated="[]" row etype title desc url cat_id rid
+  # Resolve categories + recipes; annotate rows with cat/rid.
+  local annotated="[]" row kind cat_name title cat_id rid
   while IFS= read -r row; do
-    etype="$(jq -r '.entryType' <<<"$row")"
-    title="$(jq -r '.title' <<<"$row")"
-    desc="$(jq -r '.desc' <<<"$row")"
-    url="$(jq -r '.url' <<<"$row")"
-    cat_id="$(ensure_category "$(tr '[:lower:]' '[:upper:]' <<<"${etype:0:1}")${etype:1}")"
-    rid="$(ensure_recipe "$title" "$desc" "$url")"
+    kind="$(jq -r '.kind' <<<"$row")"
+    cat_name="$(jq -r '.cat_name' <<<"$row")"
+    cat_id="$(ensure_category "$(tr '[:lower:]' '[:upper:]' <<<"${cat_name:0:1}")${cat_name:1}")" || return 1
+    rid=""
+    if [[ "$kind" == "recipe" ]]; then
+      title="$(jq -r '.title' <<<"$row")"
+      rid="$(ensure_recipe "$title" "$(jq -r '.desc' <<<"$row")" \
+        "$MEALIE_URL/g/home/r/$(jq -r '.slug' <<<"$row")" "$cat_id")" || return 1
+    fi
     annotated="$(jq -c --argjson r "$row" --arg cat "$cat_id" --arg rid "$rid" \
       '. + [$r + {cat: $cat, rid: $rid}]' <<<"$annotated")"
   done < <(jq -c '.[]' <<<"$desired")
 
-  # Diff by (date, category).
+  # Identity diff: date|cat|R:<recipe_id> or date|cat|N:<summary>.
+  # No updates - a changed meal is a delete + create.
   local actions
   actions="$(jq -cn --argjson want "$annotated" --argjson have "$sittings" '
-    ($have | map({key: ((.date[0:10]) + "|" + .meal_category_id), value: .}) | from_entries) as $h
-    | ($want | map(.date + "|" + .cat)) as $wkeys
-    | ([ $want[] | (.date + "|" + .cat) as $k
-        | if ($h[$k] | not)
-          then {a:"create", date, cat, rid, title, summary}
-          elif ($h[$k].recipe_id != .rid) or (($h[$k].summary // "") != .summary)
-          then {a:"update", id: $h[$k].id, date, cat, rid, title, summary}
-          else empty end ]
-      + [ $h | to_entries[] | select(.key as $k | $wkeys | index($k) | not)
-          | {a:"delete", id: .value.id, date: (.value.date[0:10]), title: (.value.summary // "?")} ])
+    ($want | map(. + {k: (.date + "|" + .cat + "|" +
+        (if .kind=="recipe" then "R:" + .rid else "N:" + .summary end))})) as $w
+    | ($have | map(. + {k: ((.date[0:10]) + "|" + .meal_category_id + "|" +
+        (if (.recipe_id // "") != "" then "R:" + .recipe_id else "N:" + (.summary // "") end))})) as $h
+    | ($w | map(.k)) as $wkeys
+    | ($h | map(.k)) as $hkeys
+    | ([ $w[] | select(.k as $k | $hkeys | index($k) | not)
+        | {a:"create", kind, date, cat, rid, title, summary: (.summary // "")} ]
+      + [ $h[] | select(.k as $k | $wkeys | index($k) | not)
+        | {a:"delete", id, date: (.date[0:10]), title: (.summary // .recipe_id // "?")} ])
   ')"
 
-  local n_create n_update n_delete
+  local n_create n_delete
   n_create="$(jq -r 'map(select(.a=="create"))|length' <<<"$actions")"
-  n_update="$(jq -r 'map(select(.a=="update"))|length' <<<"$actions")"
   n_delete="$(jq -r 'map(select(.a=="delete"))|length' <<<"$actions")"
-  log "Diff: $n_create create, $n_update update, $n_delete delete"
+  log "Diff: $n_create create, $n_delete delete"
 
   if (( n_delete > WINDOW_DAYS + 2 )); then
     log "ERROR: sanity brake - refusing to delete $n_delete sittings in one run"
@@ -180,7 +196,7 @@ run_sync() {
   fi
   [[ "$actions" == "[]" ]] && { log "In sync - no changes."; return 0; }
 
-  local act a date cat summary id
+  local act a date cat summary id kind2
   while IFS= read -r act; do
     a="$(jq -r '.a' <<<"$act")"
     date="$(jq -r '.date // ""' <<<"$act")"
@@ -191,24 +207,25 @@ run_sync() {
     fi
     case "$a" in
       create)
-        cat="$(jq -r '.cat' <<<"$act")"; rid="$(jq -r '.rid' <<<"$act")"
-        summary="$(jq -r '.summary' <<<"$act")"
+        kind2="$(jq -r '.kind' <<<"$act")"
+        cat="$(jq -r '.cat' <<<"$act")"
         log "Create sitting: $date '$title'"
-        local cargs=(meal create-sitting --recipe-id "$rid" --date "$date" --meal-category-id "$cat")
-        [[ -n "$summary" ]] && cargs+=(--summary "$summary")
-        sky "${cargs[@]}" >/dev/null
-        ;;
-      update)
-        id="$(jq -r '.id' <<<"$act")"; cat="$(jq -r '.cat' <<<"$act")"
-        rid="$(jq -r '.rid' <<<"$act")"; summary="$(jq -r '.summary' <<<"$act")"
-        log "Update sitting: $date '$title'"
-        sky meal update-sitting --sitting-id "$id" --date "$date" \
-          --recipe-id "$rid" --meal-category-id "$cat" --summary "$summary" >/dev/null
+        if [[ "$kind2" == "recipe" ]]; then
+          sky meal create-sitting --recipe-id "$(jq -r '.rid' <<<"$act")" \
+            --date "$date" --meal-category-id "$cat" >/dev/null \
+            || { log "ERROR: create sitting failed ($date '$title')"; return 1; }
+        else
+          summary="$(jq -r '.summary' <<<"$act")"
+          sky meal create-sitting --date "$date" --meal-category-id "$cat" \
+            --summary "$summary" >/dev/null \
+            || { log "ERROR: create sitting failed ($date '$title')"; return 1; }
+        fi
         ;;
       delete)
         id="$(jq -r '.id' <<<"$act")"
         log "Delete sitting: $date '$title'"
-        sky meal delete-sitting --sitting-id "$id" --yes >/dev/null
+        sky meal delete-sitting --sitting-id "$id" --yes >/dev/null \
+          || { log "ERROR: delete sitting failed ($date '$title')"; return 1; }
         ;;
     esac
   done < <(jq -c '.[]' <<<"$actions")
