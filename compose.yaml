@@ -1,0 +1,23 @@
+services:
+  mealie-skylight-sync:
+    build: .
+    image: mealie-skylight-sync:local
+    restart: unless-stopped
+    environment:
+      - MEALIE_URL=${MEALIE_URL}
+      - MEALIE_TOKEN=${MEALIE_TOKEN}
+      - SKYLIGHT_FRAME_ID=${SKYLIGHT_FRAME_ID}
+      - SKYLIGHT_REFRESH_TOKEN=${SKYLIGHT_REFRESH_TOKEN:-}
+      - SKYLIGHT_EMAIL=${SKYLIGHT_EMAIL:-}
+      - SKYLIGHT_PASSWORD=${SKYLIGHT_PASSWORD:-}
+      - WINDOW_DAYS=${WINDOW_DAYS:-14}
+      - SYNC_AT=${SYNC_AT:-05:00}
+      - RUN_MODE=${RUN_MODE:-loop}
+      - DRY_RUN=${DRY_RUN:-never}
+      - TZ=${TZ:-America/Chicago}
+    volumes:
+      # go-skylight ROTATES refresh tokens and persists them to
+      # ~/.skylight/config - this volume must survive restarts.
+      - skylight-config:/root/.skylight
+volumes:
+  skylight-config:
