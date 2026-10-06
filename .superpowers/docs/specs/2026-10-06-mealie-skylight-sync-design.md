@@ -49,7 +49,7 @@ SKYLIGHT_PASSWORD=<optional>
 WINDOW_DAYS=14
 SYNC_AT=05:00
 RUN_MODE=loop            # loop | oneshot
-DRY_RUN=                 # non-empty = log actions without applying
+DRY_RUN=never            # never | always | once ("1"/"true" accepted as always)
 TZ=America/Chicago
 ```
 
@@ -60,8 +60,11 @@ TZ=America/Chicago
   waits for the next cycle — it does NOT crash-loop the container.
 - `RUN_MODE=oneshot`: single sync, exit code reflects success. Used
   for local testing and ad-hoc runs (`docker compose run sync`).
-- `DRY_RUN`: prints every create/update/delete it WOULD do. First
-  deploy runs dry to review the diff before letting it write.
+- `DRY_RUN` (tri-state): `always` = every cycle logs actions without
+  applying; `never` (default) = live; `once` = first cycle after
+  container start is dry (review the diff in logs), subsequent cycles
+  live. Recommended first deploy: `once`. Default is `never` so that
+  "restart = sync now" stays live.
 - Named volume mounted at `/root/.skylight` so rotated refresh tokens
   survive restarts (R5).
 
